@@ -1,0 +1,737 @@
+---
+title: "Reanalysis of ARTESIA Account for Competing Risks"
+author: "Shao-Wei Lo and Sachin Shah"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true              # Enables table of contents
+    toc_depth: 5           # Number of heading levels to include (e.g., h1 and h2)
+    toc_float: true        # Makes the TOC float on the side as a sidebar
+    number_sections: true  # Optional: Number the sections
+    theme: readable        # Optional: Use a clean HTML theme
+editor_options: 
+  chunk_output_type: console
+---
+# Reconstruct KM/CIF Curves and Estimate HR & Log-Rank for Validation
+The goal of this step is to demonstrate that the reconstructed event-level data set reproduces the published figure and results. 
+
+```{r}
+rm(list=ls())
+
+library(tidyverse)
+library(survival)
+library(cmprsk)
+library(ggplot2)
+library(cmprsk)
+library(tibble)
+library(knitr)
+#library(gridExtra)
+library(gt)
+#library(patchwork)
+library(cowplot)
+
+data <- read_csv("ipd_main.csv")
+```
+
+
+## Reconstruct CIF Curves from 2024 NEJM paper
+This step will reproduce the inverse KM plot from Figure 1, N Engl J Med 2024;390:107-17 (https://www.nejm.org/doi/pdf/10.1056/NEJMoa2310234). This analysis treated deaths and 24 hr AF events as censoring events. 
+
+```{r}
+
+# Fit KM survival curves for each treatment arm
+# 'status == 1' indicates the outcome event of interest (stroke/SE)
+fit_cif_treat1 <- survfit(Surv(time, status == 1) ~ 1, data = data %>% filter(treat == 1), conf.type = "plain")
+fit_cif_treat0 <- survfit(Surv(time, status == 1) ~ 1, data = data %>% filter(treat == 0), conf.type = "plain")
+
+# Convert KM survival probabilities to cumulative incidence (1 - survival)
+cif_data <- bind_rows(
+  data.frame(
+    time = fit_cif_treat1$time,
+    cif = 1 - fit_cif_treat1$surv,
+    group = "Apixaban (Kaplan-Meier estimator)"
+  ),
+  data.frame(
+    time = fit_cif_treat0$time,
+    cif = 1 - fit_cif_treat0$surv,
+    group = "Aspirin (Kaplan-Meier estimator)"
+  )
+)
+
+# Plot the reconstructed Kapalan-Meier curve
+cif_ARTESIA <-
+  ggplot(cif_data, aes(x = time, y = cif*100, color = group)) +
+  geom_step(linewidth = 1.2) +
+  labs(
+    x = "Years since Randomization",
+    y = "Cumulative Incidence (%)",
+    color = "Treatment Group"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_blank(),  
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12),
+    panel.grid = element_blank(),  
+    axis.line = element_line(linewidth = 0.8, color = "black"),
+    axis.ticks.length = unit(0.3, "cm"),  
+    axis.ticks = element_line(linewidth = 0.8)  
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 10, by = 1),  
+    labels = seq(0, 10, by = 1),
+    limits = c(0, 10),  
+    expand = c(0, 0)  
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 6, by = 1),  
+    labels = seq(0, 6, by = 1),
+    limits = c(0,NA),  
+    expand = c(0, 0)  
+  ) +
+  scale_color_manual(values = c("Apixaban (Kaplan-Meier estimator)" = "black", "Aspirin (Kaplan-Meier estimator)" = "red"))
+
+cif_ARTESIA
+```
+
+## Log-Rank Test for Comparison
+```{r}
+text_log.rank <- survdiff(Surv(time, status) ~ treat, data=data, rho=0)
+text_log.rank
+```
+* Reconstructed: p = `r round(text_log.rank$pvalue,3)`
+* Published ARTESIA: p = 0.007 
+
+
+## Cox Proportional Hazards Model (cause-specific HR)
+Below we estimate the cause-specific HR using the extracted data and find that it is nearly identical to the cause-specific HR reported in the trial. 
+```{r}
+# Fit a Cox model to estimate HR of apixaban vs. aspirin
+cox_model <- coxph(Surv(time, status == 1) ~ treat, data = data)
+
+# Extract HR and 95% CI from model summary
+hr_summary <- summary(cox_model)
+hr <- hr_summary$conf.int[, "exp(coef)"]  # Hazard Ratio
+hr_lower <- hr_summary$conf.int[, "lower .95"]  # Lower 95% CI
+hr_upper <- hr_summary$conf.int[, "upper .95"]  # Upper 95% CI
+
+hr_results <- data.frame(
+  HR = round(hr,2),
+  CI_lower = round(hr_lower,2),
+  CI_upper = round(hr_upper,2)
+)
+
+print(hr_results) 
+```
+* Reconstructed: HR = `r paste0(hr_results$HR, " (", hr_results$CI_lower, " to ", hr_results$CI_upper,")")`
+* Reported by ARTESIA: HR = 0.63 (0.45 to 0.88) 
+
+
+# Prepare Data for Competing Risk Analysis
+The extracted event-level data identifies the time points when outcome events occur (i.e., status == 1) and when censoring events occur (i.e., status == 0). According to the primary publication, the following event types were censored: death, 24-hr AF, drop out, end of study. For this analysis we want to estimate the absolute risk reduction when death and 24 hour AF events are treated as competing events. Since we do not know the specific times when competing events (death, 24 hr AF) occurred, we probabilistically re-categorized censoring event as competing events, using the steps below. 
+
+## Bin Follow-Up Time into Annual Intervals
+We estimate the probability that an event that was recorded as a censoring event was actually a competing event on the year-level. That is, we collapse follow-up times into one-year bins (e.g., year 1, 2, ..., 6). This avoids the issue of sparse censoring events at exact time points.
+
+```{r}
+# Function to bin each discrete time point into 1 year intervals. max_time: upper bound of follow-up (default 6 years)
+bin_time <- function(data, max_time = 6, interval = 1) {
+  data %>%
+    mutate(bin_time = ceiling(pmin(time, max_time) / interval))
+}
+
+data_bin <- bin_time(data)
+```
+
+## Summarize Censoring and Outcome Events by Year & Treatment
+* status == 0 → censored: due to death, 24 hr AF, lost to follow-up, study end before a primary outcome event
+* status == 1 → primary event occurred: stroke or systemic embolism
+* bin_time (1–6) → Represents the year of follow-up: e.g., bin_time == 2 means Year 2
+This preprocessing is essential before probabilistically reclassifying censored cases into competing risks in the next step of the analysis.
+
+### Count censored events (status == 0) by year and treatment
+```{r}
+censored <- data_bin %>%
+  filter(status == 0) %>%                
+  group_by(bin_time, treat) %>%          
+  summarise(count = n(), .groups = "drop")  
+
+print(censored)
+```
+
+### Count primary outcome events (status == 1) by year and treatment
+```{r}
+event <- data_bin %>%
+  filter(status == 1) %>%               
+  group_by(bin_time, treat) %>%         
+  summarise(count = n(), .groups = "drop")
+
+print(event)
+```
+
+
+## Estimate Number of Competing Events from Trial Summary Statistics
+### Create year-level risk of death and 24 hrs AF 
+* Start with the number of participants at risk each year. 
+* Estimate expected deaths and 24 hr AF events in a given year
+* The number of competing evnets events (deaths and 24 hrs events) in a given divided by the number of all censoring events in that year gives the probability that censoring event should be recoded as a competing event.
+
+```{r}
+# Trial-reported counts from ARTESIA for each arm (N Engl J Med 2024;390:107-17)
+asa_enrolled <- 1997  # aspirin arm N
+asa_deaths <- 341     # deaths in aspirin arm
+asa_af <- 476         # >24h AF in aspirin arm
+
+apix_enrolled <- 2015 # apixaban arm N
+apix_deaths <- 362    # Deaths in apixaban arm
+apix_af <- 490        # >24h AF in apixaban arm
+
+##Total the number at risk starting each year. These numbers are from the Figure 1
+asa_at_risk <- c(1997, 1777, 1539, 1120, 780, 468)
+apix_at_risk <- c(2015, 1786, 1558, 1157, 820, 474)
+
+## censoring events extracted from inverse KM curve
+censoring_asa <- censored %>% filter(treat==0) %>% select(count) %>% rename(censoring = count)
+censoring_apix <- censored %>% filter(treat==1) %>% select(count) %>% rename(censoring = count)
+
+## outcome events extracted from inverse KM curve
+events_asa <- event %>% filter(treat==0) %>% select(count) %>% rename(outcome_events = count)
+events_apix <- event %>% filter(treat==1) %>% select(count) %>% rename(outcome_events = count)
+
+## create table for aspirin group
+asa_df <- tibble(
+  year = paste0(0:5, "-", 1:6),
+  at_risk = asa_at_risk,
+  )
+
+asa_df <- bind_cols(asa_df, censoring_asa, events_asa)
+
+##create table for apixaban group
+apix_df <- tibble(
+  year = paste0(0:5, "-", 1:6),
+  at_risk = apix_at_risk,
+  )
+
+apix_df <- bind_cols(apix_df, censoring_apix, events_apix)
+
+##calculate probability of 24 hr AF assuming uniform annual risk
+asa_total_at_risk  <- sum(asa_at_risk)
+apix_total_at_risk <- sum(apix_at_risk)
+
+asa_df$uniform_af_rate <- asa_af/asa_total_at_risk
+apix_df$uniform_af_rate <- apix_af/apix_total_at_risk
+
+##calculate probability of death assuming a Gompertz distribution with a beta or c of 0.12
+##estimate the number of competing events
+##estimate the probability that an observed censoring event in the extracted data is a competing event
+##first for ASA arm and then for apix arm
+c = 1.12
+weights = c(c^0, c^1, c^2, c^3, c^4, c^5)
+
+###asprin arm
+asa_df$weights = weights
+asa_df$base_death_rate = asa_deaths / sum(asa_at_risk * weights) #base death rate account for increasing mortality rate over time
+asa_df <- mutate(
+  asa_df,
+  weighted_death_prob = base_death_rate * weights, # weighted probability of death
+  est_deaths = at_risk * weighted_death_prob, #estimated deaths 
+  est_AF = at_risk * uniform_af_rate, #estimated 24 hr AF events 
+  competing_events = est_deaths + est_AF, #estimated total number of competing events
+  revised_censoring = censoring - competing_events, #new number of censoring events accounting for competing events
+  prob_competing_events = 1 - revised_censoring / censoring #probability that an observed censoring event was a competing event 
+  )
+
+###apixaban arm
+apix_df$weights = weights
+apix_df$base_death_rate = apix_deaths / sum(apix_at_risk * weights)
+apix_df <- mutate(
+  apix_df,
+  weighted_death_prob = base_death_rate * weights,
+  est_deaths = at_risk * weighted_death_prob, 
+  est_AF = at_risk * uniform_af_rate,
+  competing_events = est_deaths + est_AF, 
+  revised_censoring = censoring - competing_events, 
+  prob_competing_events = 1 - revised_censoring / censoring
+  )
+
+### PRINT
+asa_df %>%
+  select(
+    year, at_risk, censoring, outcome_events, base_death_rate,
+    weighted_death_prob, est_deaths, uniform_af_rate, est_AF,
+    competing_events, revised_censoring, prob_competing_events
+  ) %>% 
+  gt() %>% 
+   fmt_integer(
+    columns = c(est_deaths, est_AF, competing_events, revised_censoring)
+  ) %>% 
+  fmt_percent(
+    columns = c(base_death_rate,weighted_death_prob, uniform_af_rate),
+    decimals = 2) %>%
+  fmt_percent(
+    columns = prob_competing_events,
+    decimals = 1) %>%
+  cols_label(year = md("**Year (A)**"), 
+             at_risk = md("**Number at risk (B)**"), 
+             censoring = md("**Total censoring events (C)**"),
+             outcome_events = md("**Primary outcome count (D)**"),
+             base_death_rate = md("**Death rate if the rate is uniform (E)**"),
+             weighted_death_prob = md("**Death rate weighted by Gompertz distribution (F)**"),
+             est_deaths = md("**Estimated number of death (G = B*F)**"), 
+             uniform_af_rate = md("**24hr AF event rate, uniform (H)**"), 
+             est_AF = md("**Estimated number of 24hr AF events (I = B*H)**"), 
+             competing_events = md("**Total number of competing events (J = G+I)**"), 
+             revised_censoring = md("**Revised number of censoring events (K = C-J)**"), 
+             prob_competing_events = md("**Probability that an original coded censoring event was a competing event (L = 1-K/C)**")
+             ) %>% 
+  tab_header(md("**Aspirin arm**")) %>% 
+  tab_options(footnotes.marks = "standard") %>% 
+  tab_footnote(
+    footnote = md("Values from extracted event-level data from inverse-KM curve"),
+    locations = cells_column_labels(columns = c(at_risk, censoring, outcome_events))
+  ) %>% 
+    tab_footnote(
+    footnote = md("Value based on published mortality rate by arm"),
+    locations = cells_column_labels(columns = c(base_death_rate))
+  ) %>% 
+    tab_footnote(
+    footnote = md("Value based on published 24-hr AF event rate by arm"),
+    locations = cells_column_labels(columns = c(uniform_af_rate))
+  ) 
+
+
+apix_df %>%
+  select(
+    year, at_risk, censoring, outcome_events, base_death_rate,
+    weighted_death_prob, est_deaths, uniform_af_rate, est_AF,
+    competing_events, revised_censoring, prob_competing_events
+  ) %>% 
+  gt() %>% 
+   fmt_integer(
+    columns = c(est_deaths, est_AF, competing_events, revised_censoring)
+  ) %>% 
+  fmt_percent(
+    columns = c(base_death_rate,weighted_death_prob, uniform_af_rate),
+    decimals = 2) %>%
+  fmt_percent(
+    columns = prob_competing_events,
+    decimals = 1) %>%
+  cols_label(year = md("**Year (A)**"), 
+             at_risk = md("**Number at risk (B)**"), 
+             censoring = md("**Total censoring events (C)**"),
+             outcome_events = md("**Primary outcome count (D)**"),
+             base_death_rate = md("**Death rate if the rate is uniform (E)**"),
+             weighted_death_prob = md("**Death rate weighted by Gompertz distribution (F)**"),
+             est_deaths = md("**Estimated number of death (G = B*F)**"), 
+             uniform_af_rate = md("**24hr AF event rate, uniform (H)**"), 
+             est_AF = md("**Estimated number of 24hr AF events (I = B*H)**"), 
+             competing_events = md("**Total number of competing events (J = G+I)**"), 
+             revised_censoring = md("**Revised number of censoring events (K = C-J)**"), 
+             prob_competing_events = md("**Probability that an original coded censoring event was a competing event (L = 1-K/C)**")
+             ) %>% 
+  tab_header(md("**Apixaban arm**")) %>% 
+  tab_options(footnotes.marks = "standard") %>% 
+  tab_footnote(
+    footnote = md("Values from extracted event-level data from inverse-KM curve"),
+    locations = cells_column_labels(columns = c(at_risk, censoring, outcome_events))
+  ) %>% 
+    tab_footnote(
+    footnote = md("Value based on published mortality rate by arm"),
+    locations = cells_column_labels(columns = c(base_death_rate))
+  ) %>% 
+    tab_footnote(
+    footnote = md("Value based on published 24-hr AF event rate by arm"),
+    locations = cells_column_labels(columns = c(uniform_af_rate))
+  ) 
+  
+  
+
+
+
+
+```
+
+
+### Create Function 'modify_fstatus()' to Reclassifies a Portion of Censored Events as Competing Events
+```{r}
+
+competing_events_count = c(round(asa_df$competing_events),round(apix_df$competing_events))
+
+# Function to reclassify fstatus 
+modify_fstatus <- function(data_bin) {
+  data_bin <- data_bin %>%
+    mutate(fstatus = status)
+  
+  # number of cases to switch per group and bin_time
+  switch_counts <- data.frame(
+    treat = rep(0:1, each = 6),
+    bin_time = rep(1:6, 2),
+    switch_n = competing_events_count
+  )
+  
+  # reclassify fstatus randomly
+  for (i in 1:nrow(switch_counts)) {
+    subset_indices <- which(data_bin$treat == switch_counts$treat[i] & 
+                              data_bin$bin_time == switch_counts$bin_time[i] & 
+                              data_bin$fstatus == 0)
+    
+    if (length(subset_indices) >= switch_counts$switch_n[i]) {
+      switch_indices <- sample(subset_indices, switch_counts$switch_n[i])
+      data_bin$fstatus[switch_indices] <- 2
+    }
+  }
+  
+  return(data_bin)
+}
+
+```
+
+
+
+
+# Main Analysis
+## Plotting Simulated CIF Curves Using Fine–Gray Subdistribution Hazard Model
+### Step 1: create a CIF function
+```{r}
+# function to compute CIF using the 'cuminc' function
+compute_cif <- function(data_bin) {
+  cif <- cuminc(ftime = data_bin$time, fstatus = data_bin$fstatus, group = data_bin$treat)
+  return(cif)
+}
+```
+
+
+### Step 2: Run 1000 simulations probabalistically reclassifying competing events
+```{r}
+# Loop over simulations
+num_simulations <- 1000
+set.seed(51)
+
+# Pre-allocate storage lists
+cif_treat_0_list <- list()
+cif_treat_1_list <- list()
+
+# Pre-allocate vectors to store simulation results
+risk_diffs6      <- numeric(num_simulations)
+se_risk_diffs6   <- numeric(num_simulations)
+
+cuminc_treat1_6  <- numeric(num_simulations)
+cuminc_treat0_6  <- numeric(num_simulations)
+se_cuminc_treat1 <- numeric(num_simulations)
+se_cuminc_treat0 <- numeric(num_simulations)
+
+
+# Run simulations
+for (i in 1:num_simulations) {
+  # create modified dataset
+  modified_data_bin <- modify_fstatus(data_bin)
+  
+  # compute CIF
+  cif <- compute_cif(modified_data_bin)
+  
+  # store CIF results for each treatment group
+  cif_treat_0_list[[i]] <- data.frame(
+    time = cif$`0 1`$time,
+    cif = cif$`0 1`$est,
+    simulation = i
+  )
+  cif_treat_1_list[[i]] <- data.frame(
+    time = cif$`1 1`$time,
+    cif = cif$`1 1`$est,
+    simulation = i
+  )
+  
+    # extract 6-year CIF estimates for both groups
+  cif_t0 <- cif$`0 1`$est[which.min(abs(cif$`0 1`$time - 6))]
+  cif_t1 <- cif$`1 1`$est[which.min(abs(cif$`1 1`$time - 6))]
+  
+  # calculate RD and its standard error
+  rd <- cif_t1 - cif_t0
+  se_rd <- sqrt(
+    cif_t1 * (1 - cif_t1) / sum(modified_data_bin$treat == 1) +
+    cif_t0 * (1 - cif_t0) / sum(modified_data_bin$treat == 0)
+  )
+  
+  # Compute SEs for individual CIF estimates
+  se1 <- sqrt(cif_t1 * (1 - cif_t1) / sum(modified_data_bin$treat == 1))
+  se0 <- sqrt(cif_t0 * (1 - cif_t0) / sum(modified_data_bin$treat == 0))
+  
+  # Store results from current iteration
+  risk_diffs6[i]      <- rd
+  se_risk_diffs6[i]   <- se_rd
+  cuminc_treat1_6[i]  <- cif_t1
+  cuminc_treat0_6[i]  <- cif_t0
+  se_cuminc_treat1[i] <- se1
+  se_cuminc_treat0[i] <- se0
+}
+```
+
+
+### Step 3: Combine simulation results and compute confidence intervals
+```{r}
+# Combine CIF data from all simulations
+cif_treat_0_all <- do.call(rbind, cif_treat_0_list)
+cif_treat_1_all <- do.call(rbind, cif_treat_1_list)
+
+# Summarize percentiles for each time point by treatment group
+percentiles_cif_treat_0 <- cif_treat_0_all %>%
+  group_by(time) %>%
+  summarise(
+    p2.5 = quantile(cif, 0.025, na.rm = TRUE),
+    p50 = quantile(cif, 0.5, na.rm = TRUE),
+    p97.5 = quantile(cif, 0.975, na.rm = TRUE)
+  ) %>%
+  mutate(group = "Aspirin (Aalen-Johansen estimator)")
+
+percentiles_cif_treat_1 <- cif_treat_1_all %>%
+  group_by(time) %>%
+  summarise(
+    p2.5 = quantile(cif, 0.025, na.rm = TRUE),
+    p50 = quantile(cif, 0.5, na.rm = TRUE),
+    p97.5 = quantile(cif, 0.975, na.rm = TRUE)
+  ) %>%
+  mutate(group = "Apixaban (Aalen-Johansen estimator)")
+
+# Combine both treatment groups into one dataset
+percentiles_cif_data <- bind_rows(percentiles_cif_treat_0, percentiles_cif_treat_1)
+```
+
+## Risk Difference at 6 Years Using Kaplan-Meier analysis (death and 24-hr AF events treated as censoring events)
+* Estimate the 6-year cumulative incidence of the primary event (stroke/systemic embolism)
+* For each treatment arm, and compute the Risk Difference (RD) with 95% Confidence Interval (CI),
+# Using a Kaplan-Meier analysis (deaths and 24-hr AF events are censored)
+```{r}
+#Used the approach below to mirror the method used in the competing events analysis. A bootstrapped estimate of the confidence interval using a KM analysis was very close. For parallelism, we are going to report the results from the approach below. 
+
+# fstatus = 1 indicates the event of interest
+cif <- cuminc(
+  ftime   = data_bin$time,
+  fstatus = data_bin$status,  
+  group   = data_bin$treat
+)
+
+# Extract point estimates and variances at 6 years for each arm
+# '0 1' = Aspirin arm, event type 1
+# '1 1' = Apixaban arm, event type 1
+cif_t0 <- cif$`0 1`$est[which.min(abs(cif$`0 1`$time - 6))]  # Control group
+cif_t0_var <- cif$`0 1`$var[which.min(abs(cif$`0 1`$time - 6))]
+
+cif_t1 <- cif$`1 1`$est[which.min(abs(cif$`1 1`$time - 6))]  # Treatment group
+cif_t1_var <- cif$`1 1`$var[which.min(abs(cif$`1 1`$time - 6))]
+
+# Calculate Risk Difference and its standard error
+rd <- cif_t1 - cif_t0
+se_rd <- sqrt(cif_t0_var + cif_t1_var)
+
+# Calculate individual standard errors
+se_t1 <- sqrt(cif_t1_var)
+se_t0 <- sqrt(cif_t0_var)
+
+# Compute 95% Confidence Intervals for each estimate
+ci_lower_cif_t1 <- cif_t1 - 1.96 * se_t1
+ci_upper_cif_t1 <- cif_t1 + 1.96 * se_t1
+
+ci_lower_cif_t0 <- cif_t0 - 1.96 * se_t0
+ci_upper_cif_t0 <- cif_t0 + 1.96 * se_t0
+
+ci_lower_rd <- rd - 1.96 * se_rd
+ci_upper_rd <- rd + 1.96 * se_rd
+
+# summary 
+summary_table_initial <- tibble(
+  Group = c("Absolute risk reduction", "Apixaban arm", "Aspirin arm"),
+  Estimate = c(rd, cif_t1, cif_t0),
+  `Standard Error` = c(se_rd, se_t1, se_t0),
+  `95% CI Lower` = c(ci_lower_rd, ci_lower_cif_t1, ci_lower_cif_t0),
+  `95% CI Upper` = c(ci_upper_rd, ci_upper_cif_t1, ci_upper_cif_t0)
+)
+
+
+summary_table_initial %>% 
+  gt() %>% 
+  fmt_percent() %>% 
+  tab_header(md("**Absolute risk redcution at 6-years treating death and 24hr AF events as censoring events**"))
+  
+
+```
+* This analysis treats death and AF progression as censoring events, mirroring the original ARTESIA design.
+* RD estimates the absolute treatment benefit of apixaban over aspirin at 6 years.
+	
+## Risk Difference at 6 Years Using Competing Risks Simulations
+```{r}
+# Mean RD and its 95% CI
+mean_risk_diff6    <- mean(risk_diffs6)
+mean_se_risk_diff6 <- mean(se_risk_diffs6)
+ci_lower_rd_aj        <- mean_risk_diff6 - 1.96 * mean_se_risk_diff6
+ci_upper_rd_aj        <- mean_risk_diff6 + 1.96 * mean_se_risk_diff6
+
+# Treatment arm (Apixaban)
+mean_cif_t1       <- mean(cuminc_treat1_6)
+mean_se_cif_t1    <- mean(se_cuminc_treat1)
+ci_lower_cif_t1   <- mean_cif_t1 - 1.96 * mean_se_cif_t1
+ci_upper_cif_t1   <- mean_cif_t1 + 1.96 * mean_se_cif_t1
+
+# Control arm (Aspirin)
+mean_cif_t0       <- mean(cuminc_treat0_6)
+mean_se_cif_t0    <- mean(se_cuminc_treat0)
+ci_lower_cif_t0   <- mean_cif_t0 - 1.96 * mean_se_cif_t0
+ci_upper_cif_t0   <- mean_cif_t0 + 1.96 * mean_se_cif_t0
+
+
+# Combine all estimates into a summary table
+summary_table_competing <- tibble(
+  Group = c("Absolute risk reduction", "Apixaban arm", "Aspirin arm"),
+  Estimate = c(mean_risk_diff6, mean_cif_t1, mean_cif_t0),
+  `Standard Error` = c(mean_se_risk_diff6, mean_se_cif_t1, mean_se_cif_t0),
+  `95% CI Lower` = c(ci_lower_rd_aj, ci_lower_cif_t1, ci_lower_cif_t0),
+  `95% CI Upper` = c(ci_upper_rd_aj, ci_upper_cif_t1, ci_upper_cif_t0)
+)
+
+# Display results
+summary_table_competing %>% 
+  gt() %>% 
+  fmt_percent() %>% 
+  tab_header(md("**Absolute risk reduction at 6-years treating death and 24hr AF events as competing events**"))
+```
+
+
+
+## Plot
+```{r}
+#theme
+
+cust_min_theme <-  theme_minimal() +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_blank(),  
+    legend.text = element_text(size = 12),
+    legend.position = "top",  
+    legend.box = "horizontal",  
+    legend.spacing.x = unit(0.5, "cm"),  
+    panel.grid = element_blank(),
+    axis.line = element_line(linewidth = 0.8, color = "black"),
+    axis.ticks.length = unit(0.3, "cm"),
+    axis.ticks = element_line(linewidth = 0.8)
+  ) 
+
+plot.full <-  ggplot() +
+  # Median CIF curves from competing risks simulations
+  geom_line(data = percentiles_cif_data, aes(x = time, y = p50*100, color = group), linewidth = 1) +
+  geom_step(data = cif_data, aes(x = time, y = cif*100, color = group), size = 1) +
+   scale_y_continuous(
+    breaks = seq(0, 100, by = 10),
+    labels = seq(0, 100, by = 10),
+    limits = c(0, 100),
+    expand = c(0, 0)
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 6, by = 1),
+    labels = seq(0, 6, by = 1),
+    limits = c(0, NA),
+    expand = c(0, 0)
+  ) +
+  scale_color_manual(values = c(
+    "Apixaban (Kaplan-Meier estimator)" = "grey",
+    "Aspirin (Kaplan-Meier estimator)" = "pink",
+    "Apixaban (Aalen-Johansen estimator)" = "black",
+    "Aspirin (Aalen-Johansen estimator)" = "red"
+  )) +
+   labs(
+    title = "Cumulative Incidence Function (CIF) by Treatment Group",
+    x = "Years since Randomization",
+    y = "Cumulative Incidence (%)"
+    #color = "Treatment Group",
+    #fill = "Treatment Group"
+  ) +
+   cust_min_theme +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) 
+
+
+## format ARR lablels
+text_arr_km <- paste0(
+  round(rd*100,2), 
+  "% (95% CI ", 
+  round(ci_lower_rd*100,2),
+  " to ",
+  round(ci_upper_rd*100,2), 
+  ")"
+  )
+
+text_arr_aj <- paste0(
+  round(mean_risk_diff6*100,2), 
+  "% (95% CI ", 
+  round(ci_lower_rd_aj*100,2),
+  " to ",
+  round(ci_upper_rd_aj*100,2), 
+  ")"
+  )
+
+##zoomed inset
+
+plot.zoomed <- 
+  plot.full +
+   scale_y_continuous(
+    breaks = seq(0, 10, by = 1),
+    labels = seq(0, 10, by = 1),
+    limits = c(0, 10),
+    expand = c(0, 0)
+  ) +
+  cust_min_theme +
+  theme(
+  legend.position="none",
+  axis.title.x=element_blank(), 
+  axis.title.y=element_blank()
+  )  +
+  annotate(geom="text", x = 0.25, y=8.8, hjust =0, label=paste0("ARR by Kaplan-Meier = ", text_arr_km)) + 
+  annotate(geom="text", x = 0.25, y=9.2, hjust=0, label=paste0("ARR by Aalen-Johansen = ", text_arr_aj))
+  
+##add risk table
+
+risk_table <- data.frame(
+  treat = rep(c("Aspirin", "Apixaban"), each = 7), 
+  time = seq(0, 6, by = 1), 
+  n_risk = c(asa_at_risk, 200, apix_at_risk, 214)
+)
+
+ticks <- seq(0, 6, by = 1)
+
+p_tab <- ggplot(risk_table, aes(x = time, y = treat, label = n_risk)) +
+  geom_text() +
+  scale_x_continuous(breaks = ticks) +
+  labs(x = NULL, y = NULL, title = "Number at risk") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.y = element_text(size=12, color = "black"),
+        panel.grid = element_blank(),
+        axis.text.x = element_blank(),
+        plot.title = element_text(hjust = 0),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank()
+    )
+    
+
+#align table and plot
+top_wider <- plot_grid(NULL, plot.full, NULL, 
+                     ncol = 3, 
+                     rel_widths = c(0.052, 1, 0.04))  # middle is real plot
+
+plot.combined <- plot_grid(top_wider, p_tab, 
+                   ncol = 1 ,
+          rel_heights = c(1,0.15))
+
+plot.inset <- 
+  ggdraw() +
+  draw_plot(plot.combined) +
+  draw_plot(plot.zoomed, x = 0.2, y = 0.35, width = 0.76, height = 0.56)
+
+
+plot.inset
+ggsave(paste0("CIF plot ", format(Sys.time(), "%Y-%m-%d_%H-%M"), ".pdf"), width = 10, height = 9)   
+
+#height 900; width 1000
+
+
+```

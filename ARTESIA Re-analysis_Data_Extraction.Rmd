@@ -1,0 +1,112 @@
+---
+title: "ARTESIA Re-analysis_Data_Extraction"
+author: "Shao"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# Extract Individual Patient Data (IPD) from the Kaplan-Meier Curve 
+(Note: This cannot be Knit directly)
+
+## Apixaban Arm
+### Step 1: Load required libraries
+```{r eval=FALSE, include=FALSE}
+# These libraries support image reading, interactive point extraction, and IPD reconstruction
+library(ggplot2)
+library(dplyr)
+library(survival)
+library(gridExtra)
+library(readbitmap)
+library(IPDfromKM)
+library(digitize)
+```
+### Step 2: Digitize KM curve
+```{r eval=FALSE, include=FALSE}
+# You will be prompted to click along the KM curve in the image.
+# Define x-axis (time in years: 0 to 6) and y-axis (1 - cumulative incidence: 0 to 0.1) limits
+getpoints.main_apx <- getpoints("/Users/shao-weilo/Library/CloudStorage/OneDrive-Personal/01 Harvard MPH/Dr. Shah/01 Artesia reanalysis/Re ARTESIA/ARTESIA inverse KM curve 2025-07-23.png", 0, 6, 0, 0.1)
+```
+### Step 3: Post-process digitized survival points
+```{r eval=FALSE, include=FALSE}
+# Replace any negative y-values (due to digitizing artifacts) with 0
+getpoints.main_apx[, 2][getpoints.main_apx[, 2] < 0] <- 0
+
+# Convert digitized values to survival probabilities
+# Since the image shows 1 - CI (cumulative incidence), subtract from 1 to get survival probability
+getpoints.main_apx[,2] <- 1 - getpoints.main_apx[,2]
+```
+### Step 4: Prepare input for IPD reconstruction
+```{r eval=FALSE, include=FALSE}
+# trisk: time points at which number-at-risk is reported (from published figure)
+# nrisk: number of patients at risk at each time point
+# totalpts: total randomized to Apixaban (2015)
+trisk <- c(0,1,2,3,4,5,6)
+nrisk <- c(2015,1786,1558,1157,820,474,214)
+totalpts <- 2015
+
+# Use preprocess() from IPDfromKM to convert survival curve and risk table into usable format
+prep.main_apx <- preprocess(getpoints.main_apx,trisk=trisk,nrisk=nrisk,totalpts=totalpts,maxy=1)
+```
+### Step 5: Reconstruct IPD using getIPD()
+```{r eval=FALSE, include=FALSE}
+# armID = 1 indicates this is the treatment group (Apixaban)
+# tot.events = number of outcome events in the Apixaban arm (from trial publication)
+ipd.main_apx <- getIPD(prep=prep.main_apx,armID=1,tot.events=55)
+
+# Inspect summary statistics of the reconstructed IPD
+summary(ipd.main_apx)
+```
+### Step 6: Save the extracted IPD as a CSV file for downstream analysis
+```{r eval=FALSE, include=FALSE}
+# Save data frame as a CSV file
+write.csv(ipd.main_apx[["IPD"]], file = "ipd_main_apx.csv", row.names = FALSE)
+```
+
+
+
+## Aspirin Arm: same approach as above
+```{r eval=FALSE, include=FALSE}
+# Extract the coordinates from Kaplan-Meier(K-M) curves by mouse-clicks
+getpoints.main_asa <- getpoints("/Users/shao-weilo/Library/CloudStorage/OneDrive-Personal/01 Harvard MPH/Dr. Shah/01 Artesia reanalysis/Re ARTESIA/Subgroup_papers/Subgroup/Aspirin KM.png", 0, 6, 0, 0.1)
+```
+
+```{r eval=FALSE, include=FALSE}
+# Replace negative values in the 2nd column with 0
+getpoints.main_asa[, 2][getpoints.main_asa[, 2] < 0] <- 0
+
+# 1-CI = surv prob
+getpoints.main_asa[,2] <- 1 - getpoints.main_asa[,2]
+```
+
+```{r eval=FALSE, include=FALSE}
+# Preprocess
+trisk <- c(0,1,2,3,4,5,6)
+nrisk <- c(1997,1777,1539,1120,780,468,200)
+totalpts <- 1997
+prep.main_asa <- preprocess(getpoints.main_asa,trisk=trisk,nrisk=nrisk,totalpts=totalpts,maxy=1)
+```
+
+```{r eval=FALSE, include=FALSE}
+# getIPD
+ipd.main_asa <- getIPD(prep=prep.main_asa,armID=0,tot.events=86)
+
+summary(ipd.main_asa)
+
+# Save data frame as a CSV file
+write.csv(ipd.main_asa[["IPD"]], file = "ipd_main_asa.csv", row.names = FALSE)
+```
+
+## Combine 2 data set
+```{r eval=FALSE, include=FALSE}
+# Read the two datasets
+ipd_main_asa <- read.csv("ipd_main_asa.csv")
+ipd_main_apx <- read.csv("ipd_main_apx.csv")
+
+# Combine the datasets
+ipd_main <- bind_rows(ipd_main_asa, ipd_main_apx)
+
+# Order the combined data by the 'time' column
+ipd_main <- ipd_main %>% arrange(time)
+
+# Export the ordered dataset to a new CSV file
+write.csv(ipd_main, "ipd_main.csv", row.names = FALSE)
+```
