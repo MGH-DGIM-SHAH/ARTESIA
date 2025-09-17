@@ -15,7 +15,7 @@ editor_options:
 # Reconstruct KM/CIF Curves and Estimate HR & Log-Rank for Validation
 The goal of this step is to demonstrate that the reconstructed event-level data set reproduces the published figure and results. 
 
-```{r}
+```{r, include=FALSE}
 rm(list=ls())
 
 library(tidyverse)
@@ -37,7 +37,7 @@ data <- read_csv("ipd_main.csv")
 ## Reconstruct CIF Curves from 2024 NEJM paper
 This step will reproduce the inverse KM plot from Figure 1, N Engl J Med 2024;390:107-17 (https://www.nejm.org/doi/pdf/10.1056/NEJMoa2310234). This analysis treated deaths and 24 hr AF events as censoring events. 
 
-```{r}
+```{r, echo = FALSE}
 
 # Fit KM survival curves for each treatment arm
 # 'status == 1' indicates the outcome event of interest (stroke/SE)
@@ -158,7 +158,12 @@ censored <- data_bin %>%
   group_by(bin_time, treat) %>%          
   summarise(count = n(), .groups = "drop")  
 
-print(censored)
+censored %>% gt() %>%  cols_label(
+    bin_time = "Study year",
+    treat = "Treatment arm (1 = apix, 0 = asa)",
+    count = "Count of censoring events"
+  )
+
 ```
 
 ### Count primary outcome events (status == 1) by year and treatment
@@ -168,7 +173,11 @@ event <- data_bin %>%
   group_by(bin_time, treat) %>%         
   summarise(count = n(), .groups = "drop")
 
-print(event)
+event %>% gt() %>%  cols_label(
+    bin_time = "Study year",
+    treat = "Treatment arm (1 = apix, 0 = asa)",
+    count = "Count of primary outcome events"
+  )
 ```
 
 
@@ -256,6 +265,9 @@ apix_df <- mutate(
   prob_competing_events = 1 - revised_censoring / censoring
   )
 
+```
+
+```{r, echo=FALSE}
 ### PRINT
 asa_df %>%
   select(
@@ -345,10 +357,6 @@ apix_df %>%
     footnote = md("Value based on published 24-hr AF event rate by arm"),
     locations = cells_column_labels(columns = c(uniform_af_rate))
   ) 
-  
-  
-
-
 
 
 ```
@@ -502,7 +510,7 @@ percentiles_cif_data <- bind_rows(percentiles_cif_treat_0, percentiles_cif_treat
 * Estimate the 6-year cumulative incidence of the primary event (stroke/systemic embolism)
 * For each treatment arm, and compute the Risk Difference (RD) with 95% Confidence Interval (CI),
 # Using a Kaplan-Meier analysis (deaths and 24-hr AF events are censored)
-```{r}
+```{r, echo = FALSE}
 #Used the approach below to mirror the method used in the competing events analysis. A bootstrapped estimate of the confidence interval using a KM analysis was very close. For parallelism, we are going to report the results from the approach below. 
 
 # fstatus = 1 indicates the event of interest
@@ -560,7 +568,7 @@ summary_table_initial %>%
 * RD estimates the absolute treatment benefit of apixaban over aspirin at 6 years.
 	
 ## Risk Difference at 6 Years Using Competing Risks Simulations
-```{r}
+```{r, echo = FALSE}
 # Mean RD and its 95% CI
 mean_risk_diff6    <- mean(risk_diffs6)
 mean_se_risk_diff6 <- mean(se_risk_diffs6)
@@ -599,7 +607,7 @@ summary_table_competing %>%
 
 
 ## Plot
-```{r}
+```{r, echo = FALSE, message = FALSE, warning=FALSE, fig.width=10, fig.height=9, fig.align='center',}
 #theme
 
 cust_min_theme <-  theme_minimal() +
