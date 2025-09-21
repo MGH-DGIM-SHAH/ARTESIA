@@ -661,20 +661,20 @@ plot.full <-  ggplot() +
 
 ## format ARR lablels
 text_arr_km <- paste0(
-  round(rd*100,2), 
+  round(rd*-100,2), 
   "% (95% CI ", 
-  round(ci_lower_rd*100,2),
+  round(ci_upper_rd*-100,2),
   " to ",
-  round(ci_upper_rd*100,2), 
+  round(ci_lower_rd*-100,2), 
   ")"
   )
 
 text_arr_aj <- paste0(
-  round(mean_risk_diff6*100,2), 
+  round(mean_risk_diff6*-100,2), 
   "% (95% CI ", 
-  round(ci_lower_rd_aj*100,2),
+  round(ci_upper_rd_aj*-100,2),
   " to ",
-  round(ci_upper_rd_aj*100,2), 
+  round(ci_lower_rd_aj*-100,2), 
   ")"
   )
 
