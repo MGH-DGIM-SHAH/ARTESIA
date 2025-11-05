@@ -25,9 +25,7 @@ library(ggplot2)
 library(cmprsk)
 library(tibble)
 library(knitr)
-#library(gridExtra)
 library(gt)
-#library(patchwork)
 library(cowplot)
 
 data <- read_csv("ipd_main.csv")
@@ -451,33 +449,11 @@ for (i in 1:num_simulations) {
     simulation = i
   )
   
-    # extract 6-year CIF estimates for both groups
-  cif_t0 <- cif$`0 1`$est[which.min(abs(cif$`0 1`$time - 6))]
-  cif_t1 <- cif$`1 1`$est[which.min(abs(cif$`1 1`$time - 6))]
-  
-  # calculate RD and its standard error
-  rd <- cif_t1 - cif_t0
-  se_rd <- sqrt(
-    cif_t1 * (1 - cif_t1) / sum(modified_data_bin$treat == 1) +
-    cif_t0 * (1 - cif_t0) / sum(modified_data_bin$treat == 0)
-  )
-  
-  # Compute SEs for individual CIF estimates
-  se1 <- sqrt(cif_t1 * (1 - cif_t1) / sum(modified_data_bin$treat == 1))
-  se0 <- sqrt(cif_t0 * (1 - cif_t0) / sum(modified_data_bin$treat == 0))
-  
-  # Store results from current iteration
-  risk_diffs6[i]      <- rd
-  se_risk_diffs6[i]   <- se_rd
-  cuminc_treat1_6[i]  <- cif_t1
-  cuminc_treat0_6[i]  <- cif_t0
-  se_cuminc_treat1[i] <- se1
-  se_cuminc_treat0[i] <- se0
 }
 ```
 
 
-### Step 3: Combine simulation results and compute confidence intervals
+### Step 3: Combine simulation results
 ```{r}
 # Combine CIF data from all simulations
 cif_treat_0_all <- do.call(rbind, cif_treat_0_list)
@@ -506,102 +482,288 @@ percentiles_cif_treat_1 <- cif_treat_1_all %>%
 percentiles_cif_data <- bind_rows(percentiles_cif_treat_0, percentiles_cif_treat_1)
 ```
 
-## Risk Difference at 6 Years Using Kaplan-Meier analysis (death and 24-hr AF events treated as censoring events)
-* Estimate the 6-year cumulative incidence of the primary event (stroke/systemic embolism)
-* For each treatment arm, and compute the Risk Difference (RD) with 95% Confidence Interval (CI),
-# Using a Kaplan-Meier analysis (deaths and 24-hr AF events are censored)
-```{r, echo = FALSE}
-#Used the approach below to mirror the method used in the competing events analysis. A bootstrapped estimate of the confidence interval using a KM analysis was very close. For parallelism, we are going to report the results from the approach below. 
+## Cumulative risk at 3.5 years 
+* Estimate the 3.5-year cumulative risk of the primary event (stroke/systemic embolism)
+* Stratify by arm and by estimator
+* Calculate the differences in estimates using the KM estimator (death/24-hr AF are censored) vs. AJ estimator (death/24-hour AF are competing events)
+* 95% CI are bootstrapped to account for covariance in estimates
 
-# fstatus = 1 indicates the event of interest
-cif <- cuminc(
-  ftime   = data_bin$time,
-  fstatus = data_bin$status,  
-  group   = data_bin$treat
+```{r cumulative risk at 3.5 yrs, echo = FALSE}
+#givens
+tstar   <- 3.5      #estimation time point
+cause   <- 1      #outcome code in fstatus
+cencode <- 0      #censoring code in fstatus
+B       <- 1000   #num of bootstraps
+set.seed(51)
+
+#divide data by arm
+dat <- modified_data_bin
+d0 <- subset(dat, treat == 0, select = c(time, fstatus))
+d1 <- subset(dat, treat == 1, select = c(time, fstatus))
+
+# Point estimates by arm 
+
+## ---------- estimate for arm 0 ----------
+# KM (competing -> censored)
+s01_0 <- as.integer(d0$fstatus == cause)
+sf0 <- survfit(Surv(time, s01_0) ~ 1, data = d0)
+pKM0 <- 1 - summary(sf0, times = tstar, extend = TRUE)$surv
+
+# AJ (CIF) – pick element whose name ENDS with the cause code (handles "1 1"/"1 2" naming)
+ci0 <- cuminc(ftime = d0$time, fstatus = d0$fstatus, cencode = cencode)
+nms0 <- names(ci0); last0 <- trimws(sapply(strsplit(nms0, " "), function(z) tail(z, 1)))
+ix0 <- which(last0 == as.character(cause))[1]
+if (!is.na(ix0)) {
+  comp0 <- ci0[[ix0]]
+  pAJ0 <- approx(comp0$time, comp0$est, xout = tstar,
+                 method = "constant", f = 1, rule = 2, ties = "ordered")$y
+  if (is.na(pAJ0)) pAJ0 <- tail(comp0$est, 1)
+} else pAJ0 <- 0
+
+## ---------- estimate for arm 1 ----------
+s01_1 <- as.integer(d1$fstatus == cause)
+sf1 <- survfit(Surv(time, s01_1) ~ 1, data = d1)
+pKM1 <- 1 - summary(sf1, times = tstar, extend = TRUE)$surv
+
+ci1 <- cuminc(ftime = d1$time, fstatus = d1$fstatus, cencode = cencode)
+nms1 <- names(ci1); last1 <- trimws(sapply(strsplit(nms1, " "), function(z) tail(z, 1)))
+ix1 <- which(last1 == as.character(cause))[1]
+if (!is.na(ix1)) {
+  comp1 <- ci1[[ix1]]
+  pAJ1 <- approx(comp1$time, comp1$est, xout = tstar,
+                 method = "constant", f = 1, rule = 2, ties = "ordered")$y
+  if (is.na(pAJ1)) pAJ1 <- tail(comp1$est, 1)
+} else pAJ1 <- 0
+
+# COVARIANCE between estimators so that we can accurately calcualte the SE for the difference in estimates
+## ---------- BOOTSTRAP (paired, within arm; captures KM–AJ covariance) ----------
+KM0 <- AJ0 <- numeric(B)
+KM1 <- AJ1 <- numeric(B)
+n0 <- nrow(d0); n1 <- nrow(d1)
+
+for (b in seq_len(B)) {
+  ## Arm 0
+  i0 <- sample.int(n0, n0, replace = TRUE); d0b <- d0[i0, , drop = FALSE]
+  s01_0b <- as.integer(d0b$fstatus == cause)
+  sf0b <- survfit(Surv(time, s01_0b) ~ 1, data = d0b)
+  KM0[b] <- 1 - summary(sf0b, times = tstar, extend = TRUE)$surv
+
+  ci0b <- try(cuminc(d0b$time, d0b$fstatus, cencode = cencode), silent = TRUE)
+  if (!inherits(ci0b, "try-error")) {
+    nms0b <- names(ci0b); last0b <- trimws(sapply(strsplit(nms0b, " "), function(z) tail(z, 1)))
+    ix0b <- which(last0b == as.character(cause))[1]
+    if (!is.na(ix0b)) {
+      comp0b <- ci0b[[ix0b]]
+      val <- approx(comp0b$time, comp0b$est, xout = tstar,
+                    method = "constant", f = 1, rule = 2, ties = "ordered")$y
+      if (is.na(val)) val <- tail(comp0b$est, 1)
+      AJ0[b] <- val
+    } else AJ0[b] <- 0
+  } else AJ0[b] <- 0
+
+  ## Arm 1
+  i1 <- sample.int(n1, n1, replace = TRUE); d1b <- d1[i1, , drop = FALSE]
+  s01_1b <- as.integer(d1b$fstatus == cause)
+  sf1b <- survfit(Surv(time, s01_1b) ~ 1, data = d1b)
+  KM1[b] <- 1 - summary(sf1b, times = tstar, extend = TRUE)$surv
+
+  ci1b <- try(cuminc(d1b$time, d1b$fstatus, cencode = cencode), silent = TRUE)
+  if (!inherits(ci1b, "try-error")) {
+    nms1b <- names(ci1b); last1b <- trimws(sapply(strsplit(nms1b, " "), function(z) tail(z, 1)))
+    ix1b <- which(last1b == as.character(cause))[1]
+    if (!is.na(ix1b)) {
+      comp1b <- ci1b[[ix1b]]
+      val <- approx(comp1b$time, comp1b$est, xout = tstar,
+                    method = "constant", f = 1, rule = 2, ties = "ordered")$y
+      if (is.na(val)) val <- tail(comp1b$est, 1)
+      AJ1[b] <- val
+    } else AJ1[b] <- 0
+  } else AJ1[b] <- 0
+}
+
+# OUTPUT
+D0 <- AJ0 - KM0
+D1 <- AJ1 - KM1
+
+est_arm0 <- c(KM = pKM0, AJ = pAJ0, Diff = pAJ0 - pKM0)
+est_arm1 <- c(KM = pKM1, AJ = pAJ1, Diff = pAJ1 - pKM1)
+
+ci_arm0 <- quantile(D0, c(0.025, 0.975), na.rm = TRUE)
+ci_arm1 <- quantile(D1, c(0.025, 0.975), na.rm = TRUE)
+
+cov_arm0 <- cov(KM0, AJ0); cor_arm0 <- cov_arm0 / (sd(KM0) * sd(AJ0))
+cov_arm1 <- cov(KM1, AJ1); cor_arm1 <- cov_arm1 / (sd(KM1) * sd(AJ1))
+
+res <- data.frame(
+  arm = c("Aspirin", "Apixaban"),
+  KM_risk = c(est_arm0["KM"],  est_arm1["KM"]),
+  AJ_risk = c(est_arm0["AJ"],  est_arm1["AJ"]),
+  Diff_AJ_minus_KM = c(est_arm0["Diff"], est_arm1["Diff"]),
+  CI_low = c(ci_arm0[1], ci_arm1[1]),
+  CI_high = c(ci_arm0[2], ci_arm1[2])
+  #KM_AJ_cov = c(cov_arm0, cov_arm1),
+  #KM_AJ_cor = c(cor_arm0, cor_arm1)
 )
 
-# Extract point estimates and variances at 6 years for each arm
-# '0 1' = Aspirin arm, event type 1
-# '1 1' = Apixaban arm, event type 1
-cif_t0 <- cif$`0 1`$est[which.min(abs(cif$`0 1`$time - 6))]  # Control group
-cif_t0_var <- cif$`0 1`$var[which.min(abs(cif$`0 1`$time - 6))]
+pct <- function(x) sprintf("%.2f%%", 100*x)
+res_print <- within(res, {
+  KM_risk <- pct(KM_risk); AJ_risk <- pct(AJ_risk)
+  Diff_AJ_minus_KM <- pct(Diff_AJ_minus_KM)
+  CI <- paste0(pct(CI_low), " to ", pct(CI_high))
+  CI_low <- NULL; CI_high <- NULL
+})
 
-cif_t1 <- cif$`1 1`$est[which.min(abs(cif$`1 1`$time - 6))]  # Treatment group
-cif_t1_var <- cif$`1 1`$var[which.min(abs(cif$`1 1`$time - 6))]
+res_print %>% gt() %>%  cols_label(
+  arm = md("**Group**"),  
+  KM_risk = md("**Risk with KM estimator**"),
+    AJ_risk = md("**Risk with AJ estimator**"),
+    Diff_AJ_minus_KM = md("**Difference**"),
+    CI = md("**95% confidence interval**")
+  ) 
 
-# Calculate Risk Difference and its standard error
-rd <- cif_t1 - cif_t0
-se_rd <- sqrt(cif_t0_var + cif_t1_var)
-
-# Calculate individual standard errors
-se_t1 <- sqrt(cif_t1_var)
-se_t0 <- sqrt(cif_t0_var)
-
-# Compute 95% Confidence Intervals for each estimate
-ci_lower_cif_t1 <- cif_t1 - 1.96 * se_t1
-ci_upper_cif_t1 <- cif_t1 + 1.96 * se_t1
-
-ci_lower_cif_t0 <- cif_t0 - 1.96 * se_t0
-ci_upper_cif_t0 <- cif_t0 + 1.96 * se_t0
-
-ci_lower_rd <- rd - 1.96 * se_rd
-ci_upper_rd <- rd + 1.96 * se_rd
-
-# summary 
-summary_table_initial <- tibble(
-  Group = c("Absolute risk reduction", "Apixaban arm", "Aspirin arm"),
-  Estimate = c(rd, cif_t1, cif_t0),
-  `Standard Error` = c(se_rd, se_t1, se_t0),
-  `95% CI Lower` = c(ci_lower_rd, ci_lower_cif_t1, ci_lower_cif_t0),
-  `95% CI Upper` = c(ci_upper_rd, ci_upper_cif_t1, ci_upper_cif_t0)
-)
-
-
-summary_table_initial %>% 
-  gt() %>% 
-  fmt_percent() %>% 
-  tab_header(md("**Absolute risk redcution at 6-years treating death and 24hr AF events as censoring events**"))
-  
 
 ```
-* This analysis treats death and AF progression as censoring events, mirroring the original ARTESIA design.
-* RD estimates the absolute treatment benefit of apixaban over aspirin at 6 years.
 	
-## Risk Difference at 6 Years Using Competing Risks Simulations
-```{r, echo = FALSE}
-# Mean RD and its 95% CI
-mean_risk_diff6    <- mean(risk_diffs6)
-mean_se_risk_diff6 <- mean(se_risk_diffs6)
-ci_lower_rd_aj        <- mean_risk_diff6 - 1.96 * mean_se_risk_diff6
-ci_upper_rd_aj        <- mean_risk_diff6 + 1.96 * mean_se_risk_diff6
+## Risk Difference at 3.5 Years using KM and AJ estimators
+* We estiamte the ARR using the KM estimator and the AJ estimator
+* We take the difference and use bootstrapping to define the 95% CI
 
-# Treatment arm (Apixaban)
-mean_cif_t1       <- mean(cuminc_treat1_6)
-mean_se_cif_t1    <- mean(se_cuminc_treat1)
-ci_lower_cif_t1   <- mean_cif_t1 - 1.96 * mean_se_cif_t1
-ci_upper_cif_t1   <- mean_cif_t1 + 1.96 * mean_se_cif_t1
+```{r need to change, echo = FALSE}
 
-# Control arm (Aspirin)
-mean_cif_t0       <- mean(cuminc_treat0_6)
-mean_se_cif_t0    <- mean(se_cuminc_treat0)
-ci_lower_cif_t0   <- mean_cif_t0 - 1.96 * mean_se_cif_t0
-ci_upper_cif_t0   <- mean_cif_t0 + 1.96 * mean_se_cif_t0
+## --- SETTINGS ---
+tstar   <- 3.5      # horizon (same units as dat$time)
+cause   <- 1      # event-of-interest code in fstatus
+cencode <- 0      # censoring code
+B       <- 1000
+set.seed(51)
 
 
-# Combine all estimates into a summary table
-summary_table_competing <- tibble(
-  Group = c("Absolute risk reduction", "Apixaban arm", "Aspirin arm"),
-  Estimate = c(mean_risk_diff6, mean_cif_t1, mean_cif_t0),
-  `Standard Error` = c(mean_se_risk_diff6, mean_se_cif_t1, mean_se_cif_t0),
-  `95% CI Lower` = c(ci_lower_rd_aj, ci_lower_cif_t1, ci_lower_cif_t0),
-  `95% CI Upper` = c(ci_upper_rd_aj, ci_upper_cif_t1, ci_upper_cif_t0)
+dat <- modified_data_bin
+d0 <- subset(dat, treat == 0, select = c(time, fstatus))
+d1 <- subset(dat, treat == 1, select = c(time, fstatus))
+
+## --- POINT ESTIMATES ---
+# Arm 0 KM
+s01_0 <- as.integer(d0$fstatus == cause)
+sf0   <- survfit(Surv(time, s01_0) ~ 1, data = d0)
+KM0   <- 1 - summary(sf0, times = tstar, extend = TRUE)$surv
+
+# Arm 0 AJ
+ci0   <- cuminc(ftime = d0$time, fstatus = d0$fstatus, cencode = cencode)
+nms0  <- names(ci0); last0 <- trimws(sapply(strsplit(nms0, " "), function(z) tail(z, 1)))
+ix0   <- which(last0 == as.character(cause))[1]
+if (!is.na(ix0)) {
+  comp0 <- ci0[[ix0]]
+  AJ0   <- approx(comp0$time, comp0$est, xout = tstar,
+                  method = "constant", f = 1, rule = 2, ties = "ordered")$y
+  if (is.na(AJ0)) AJ0 <- tail(comp0$est, 1)
+} else AJ0 <- 0
+
+# Arm 1 KM
+s01_1 <- as.integer(d1$fstatus == cause)
+sf1   <- survfit(Surv(time, s01_1) ~ 1, data = d1)
+KM1   <- 1 - summary(sf1, times = tstar, extend = TRUE)$surv
+
+# Arm 1 AJ
+ci1   <- cuminc(ftime = d1$time, fstatus = d1$fstatus, cencode = cencode)
+nms1  <- names(ci1); last1 <- trimws(sapply(strsplit(nms1, " "), function(z) tail(z, 1)))
+ix1   <- which(last1 == as.character(cause))[1]
+if (!is.na(ix1)) {
+  comp1 <- ci1[[ix1]]
+  AJ1   <- approx(comp1$time, comp1$est, xout = tstar,
+                  method = "constant", f = 1, rule = 2, ties = "ordered")$y
+  if (is.na(AJ1)) AJ1 <- tail(comp1$est, 1)
+} else AJ1 <- 0
+
+RD_KM_hat <- KM1 - KM0
+RD_AJ_hat <- AJ1 - AJ0
+Delta_hat <- RD_AJ_hat - RD_KM_hat
+
+
+## --- BOOTSTRAP (paired within arms) ---
+n0 <- nrow(d0); n1 <- nrow(d1)
+RD_KM <- RD_AJ <- Delta <- numeric(B)
+
+for (b in seq_len(B)) {
+  ## resample rows within each arm
+  i0 <- sample.int(n0, n0, replace = TRUE); d0b <- d0[i0, , drop = FALSE]
+  i1 <- sample.int(n1, n1, replace = TRUE); d1b <- d1[i1, , drop = FALSE]
+
+  ## KM arm 0
+  s01_0b <- as.integer(d0b$fstatus == cause)
+  sf0b   <- survfit(Surv(time, s01_0b) ~ 1, data = d0b)
+  KM0b   <- 1 - summary(sf0b, times = tstar, extend = TRUE)$surv
+
+  ## KM arm 1
+  s01_1b <- as.integer(d1b$fstatus == cause)
+  sf1b   <- survfit(Surv(time, s01_1b) ~ 1, data = d1b)
+  KM1b   <- 1 - summary(sf1b, times = tstar, extend = TRUE)$surv
+
+  ## AJ arm 0
+  ci0b <- try(cuminc(d0b$time, d0b$fstatus, cencode = cencode), silent = TRUE)
+  if (!inherits(ci0b, "try-error")) {
+    n0n  <- names(ci0b); last0b <- trimws(sapply(strsplit(n0n, " "), function(z) tail(z, 1)))
+    j0   <- which(last0b == as.character(cause))[1]
+    if (!is.na(j0)) {
+      c0b <- ci0b[[j0]]
+      AJ0b <- approx(c0b$time, c0b$est, xout = tstar,
+                     method = "constant", f = 1, rule = 2, ties = "ordered")$y
+      if (is.na(AJ0b)) AJ0b <- tail(c0b$est, 1)
+    } else AJ0b <- 0
+  } else AJ0b <- 0
+
+  ## AJ arm 1
+  ci1b <- try(cuminc(d1b$time, d1b$fstatus, cencode = cencode), silent = TRUE)
+  if (!inherits(ci1b, "try-error")) {
+    n1n  <- names(ci1b); last1b <- trimws(sapply(strsplit(n1n, " "), function(z) tail(z, 1)))
+    j1   <- which(last1b == as.character(cause))[1]
+    if (!is.na(j1)) {
+      c1b <- ci1b[[j1]]
+      AJ1b <- approx(c1b$time, c1b$est, xout = tstar,
+                     method = "constant", f = 1, rule = 2, ties = "ordered")$y
+      if (is.na(AJ1b)) AJ1b <- tail(c1b$est, 1)
+    } else AJ1b <- 0
+  } else AJ1b <- 0
+
+  ## store contrasts
+  RD_KM[b] <- KM1b - KM0b
+  RD_AJ[b] <- AJ1b - AJ0b
+  Delta[b] <- RD_AJ[b] - RD_KM[b]
+}
+
+## --- CIs (percentile; paired by construction) ---
+ci_RD_KM  <- quantile(RD_KM, c(0.025, 0.975), na.rm = TRUE)
+ci_RD_AJ  <- quantile(RD_AJ, c(0.025, 0.975), na.rm = TRUE)
+ci_Delta  <- quantile(Delta, c(0.025, 0.975), na.rm = TRUE)
+
+## --- Bootstrap p-value for H0: Delta = 0 (symmetric two-sided) ---
+pval_Delta <- 2 * min(
+  mean(Delta >= 0, na.rm = TRUE),
+  mean(Delta <= 0, na.rm = TRUE)
 )
 
-# Display results
-summary_table_competing %>% 
-  gt() %>% 
-  fmt_percent() %>% 
-  tab_header(md("**Absolute risk reduction at 6-years treating death and 24hr AF events as competing events**"))
+## --- PRINT (percent format) ---
+pct <- function(x) sprintf("%.2f%%", 100*x)
+
+data.frame(
+  Estimators = c("Kaplan-Meier", "Aalen-Johansen", "Difference"),
+  Event = c("Censoring events", "Competing events", "--"),
+  Estimate = c(pct(RD_KM_hat), pct(RD_AJ_hat),  pct(Delta_hat)), 
+  CI = c(paste0(pct(ci_RD_KM[1]), " to ", pct(ci_RD_KM[2])), 
+               paste0(pct(ci_RD_AJ[1]), " to ", pct(ci_RD_AJ[2])),
+               paste0(pct(ci_Delta[1]), " to ", pct(ci_Delta[2]))
+              )
+                      ) %>% gt() %>% 
+  cols_label(
+    Estimators = md("**Estimator**"),
+    Event = md("**How are deaths and 24hr-AF events handled?**"),
+    Estimate = md("**Estimate**"),
+    CI = md("**95% Confidence interval**")
+    )
+
+
+
+
 ```
 
 
@@ -661,22 +823,32 @@ plot.full <-  ggplot() +
 
 ## format ARR lablels
 text_arr_km <- paste0(
-  round(rd*-100,2), 
-  "% (95% CI ", 
-  round(ci_upper_rd*-100,2),
+  round(RD_KM_hat*-100,2), 
+  "% (95% CI, ", 
+  round(ci_RD_KM[2]*-100,2),
   " to ",
-  round(ci_lower_rd*-100,2), 
+  round(ci_RD_KM[1]*-100,2), 
   ")"
   )
 
 text_arr_aj <- paste0(
-  round(mean_risk_diff6*-100,2), 
-  "% (95% CI ", 
-  round(ci_upper_rd_aj*-100,2),
+  round(RD_AJ_hat*-100,2), 
+  "% (95% CI, ", 
+  round(ci_RD_AJ[2]*-100,2),
   " to ",
-  round(ci_lower_rd_aj*-100,2), 
+  round(ci_RD_AJ[1]*-100,2), 
   ")"
   )
+
+text_diff <- paste0(
+  round(Delta_hat*100,2), 
+  " pp (95% CI, ", 
+  round(ci_Delta[1]*100,2),
+  " to ",
+  round(ci_Delta[2]*100,2), 
+  ")"
+  )
+
 
 ##zoomed inset
 
@@ -694,8 +866,9 @@ plot.zoomed <-
   axis.title.x=element_blank(), 
   axis.title.y=element_blank()
   )  +
-  annotate(geom="text", x = 0.25, y=8.8, hjust =0, label=paste0("ARR by Kaplan-Meier = ", text_arr_km)) + 
-  annotate(geom="text", x = 0.25, y=9.2, hjust=0, label=paste0("ARR by Aalen-Johansen = ", text_arr_aj))
+  annotate(geom="text", x = 0.25, y=8.8, hjust =0, label=paste0("ARR by Kaplan-Meier at 3.5 yrs.= ", text_arr_km)) + 
+  annotate(geom="text", x = 0.25, y=9.2, hjust=0, label=paste0("ARR by Aalen-Johansen at 3.5 yrs. = ", text_arr_aj)) +
+  annotate(geom="text", x = 0.25, y=8.4, hjust=0, label=paste0("Difference in estimates at 3.5 yrs. = ", text_diff))
   
 ##add risk table
 
@@ -738,8 +911,10 @@ plot.inset <-
 
 plot.inset
 ggsave(paste0("CIF plot ", format(Sys.time(), "%Y-%m-%d_%H-%M"), ".pdf"), width = 10, height = 9)   
+ggsave(paste0("CIF plot ", format(Sys.time(), "%Y-%m-%d_%H-%M"), ".png"), width = 10, height = 9)   
 
 #height 900; width 1000
 
 
 ```
+ 
