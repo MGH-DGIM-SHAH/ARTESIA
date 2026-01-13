@@ -16,6 +16,7 @@ editor_options:
 The goal of this step is to demonstrate that the reconstructed event-level data set reproduces the published figure and results. 
 
 ```{r, include=FALSE}
+#v3 includes looped bootstraps
 rm(list=ls())
 
 library(tidyverse)
@@ -418,6 +419,7 @@ set.seed(51)
 # Pre-allocate storage lists
 cif_treat_0_list <- list()
 cif_treat_1_list <- list()
+data.m <- list()
 
 # Pre-allocate vectors to store simulation results
 risk_diffs6      <- numeric(num_simulations)
@@ -433,6 +435,7 @@ se_cuminc_treat0 <- numeric(num_simulations)
 for (i in 1:num_simulations) {
   # create modified dataset
   modified_data_bin <- modify_fstatus(data_bin)
+  data.m[[i]] <- modified_data_bin %>% select("time", "fstatus", "treat")
   
   # compute CIF
   cif <- compute_cif(modified_data_bin)
@@ -496,8 +499,14 @@ cencode <- 0      #censoring code in fstatus
 B       <- 1000   #num of bootstraps
 set.seed(51)
 
+
+res <- list()
+
+for (i in 1:num_simulations) {
+
+
 #divide data by arm
-dat <- modified_data_bin
+dat <- data.m[[i]]
 d0 <- subset(dat, treat == 0, select = c(time, fstatus))
 d1 <- subset(dat, treat == 1, select = c(time, fstatus))
 
@@ -513,12 +522,9 @@ pKM0 <- 1 - summary(sf0, times = tstar, extend = TRUE)$surv
 ci0 <- cuminc(ftime = d0$time, fstatus = d0$fstatus, cencode = cencode)
 nms0 <- names(ci0); last0 <- trimws(sapply(strsplit(nms0, " "), function(z) tail(z, 1)))
 ix0 <- which(last0 == as.character(cause))[1]
-if (!is.na(ix0)) {
   comp0 <- ci0[[ix0]]
   pAJ0 <- approx(comp0$time, comp0$est, xout = tstar,
                  method = "constant", f = 1, rule = 2, ties = "ordered")$y
-  if (is.na(pAJ0)) pAJ0 <- tail(comp0$est, 1)
-} else pAJ0 <- 0
 
 ## ---------- estimate for arm 1 ----------
 s01_1 <- as.integer(d1$fstatus == cause)
@@ -528,12 +534,11 @@ pKM1 <- 1 - summary(sf1, times = tstar, extend = TRUE)$surv
 ci1 <- cuminc(ftime = d1$time, fstatus = d1$fstatus, cencode = cencode)
 nms1 <- names(ci1); last1 <- trimws(sapply(strsplit(nms1, " "), function(z) tail(z, 1)))
 ix1 <- which(last1 == as.character(cause))[1]
-if (!is.na(ix1)) {
   comp1 <- ci1[[ix1]]
   pAJ1 <- approx(comp1$time, comp1$est, xout = tstar,
                  method = "constant", f = 1, rule = 2, ties = "ordered")$y
-  if (is.na(pAJ1)) pAJ1 <- tail(comp1$est, 1)
-} else pAJ1 <- 0
+  
+
 
 # COVARIANCE between estimators so that we can accurately calcualte the SE for the difference in estimates
 ## ---------- BOOTSTRAP (paired, within arm; captures KM–AJ covariance) ----------
@@ -594,7 +599,7 @@ ci_arm1 <- quantile(D1, c(0.025, 0.975), na.rm = TRUE)
 cov_arm0 <- cov(KM0, AJ0); cor_arm0 <- cov_arm0 / (sd(KM0) * sd(AJ0))
 cov_arm1 <- cov(KM1, AJ1); cor_arm1 <- cov_arm1 / (sd(KM1) * sd(AJ1))
 
-res <- data.frame(
+res[[i]] <- data.frame(
   arm = c("Aspirin", "Apixaban"),
   KM_risk = c(est_arm0["KM"],  est_arm1["KM"]),
   AJ_risk = c(est_arm0["AJ"],  est_arm1["AJ"]),
@@ -604,14 +609,51 @@ res <- data.frame(
   #KM_AJ_cov = c(cov_arm0, cov_arm1),
   #KM_AJ_cor = c(cor_arm0, cor_arm1)
 )
+print(i)
+}
+
+KM.asa <- numeric(num_simulations)
+KM.apix<- numeric(num_simulations)
+AJ.asa<- numeric(num_simulations)
+AJ.apix<- numeric(num_simulations)
+diff.asa<- numeric(num_simulations)
+diff.apix<- numeric(num_simulations)
+ci_low_apix <- numeric(num_simulations)
+ci_low_asa <- numeric(num_simulations)
+ci_high_apix <- numeric(num_simulations)
+ci_high_asa <- numeric(num_simulations)
+
+for (i in 1:num_simulations) {
+  KM.asa <- res[[i]][1,2]
+  KM.apix<- res[[i]][2,2]
+  AJ.asa<- res[[i]][1,3]
+  AJ.apix<- res[[i]][2,3]
+  diff.asa<- res[[i]][1,4]
+  diff.apix<- res[[i]][2,4]
+  ci_low_asa <- res[[i]][1,5]
+  ci_low_apix <- res[[i]][2,5]
+  ci_high_asa <- res[[i]][1,6]
+  ci_high_apix <- res[[i]][2,6]
+}
+
+quantile(ci_low_apix, 0.5)
+quantile(ci_high_apix, 0.5)
+quantile(ci_low_asa, 0.5)
+quantile(ci_high_asa, 0.5)
 
 pct <- function(x) sprintf("%.2f%%", 100*x)
-res_print <- within(res, {
-  KM_risk <- pct(KM_risk); AJ_risk <- pct(AJ_risk)
-  Diff_AJ_minus_KM <- pct(Diff_AJ_minus_KM)
-  CI <- paste0(pct(CI_low), " to ", pct(CI_high))
-  CI_low <- NULL; CI_high <- NULL
-})
+
+res_print <- 
+  data.frame(
+    arm=c("Aspirin", "Apixaban"), 
+    KM_risk = c(pct(quantile(KM.asa, 0.5)), pct(quantile(KM.apix, 0.5))),
+    AJ_risk = c(pct(quantile(AJ.asa, 0.5)), pct(quantile(AJ.apix, 0.5))),
+    Diff_AJ_minus_KM = c(pct(quantile(diff.asa, 0.5)), pct(quantile(diff.apix, 0.5))),
+    CI = c(
+      paste0(pct(quantile(ci_low_asa,0.5)), " to ", pct(quantile(ci_high_asa,0.5))),
+      paste0(pct(quantile(ci_low_apix,0.5)), " to ", pct(quantile(ci_high_apix,0.5)))
+    )
+  )
 
 res_print %>% gt() %>%  cols_label(
   arm = md("**Group**"),  
@@ -637,8 +679,21 @@ cencode <- 0      # censoring code
 B       <- 1000
 set.seed(51)
 
+pval_Delta <- numeric(num_simulations)
+RD_KM_hat<- numeric(num_simulations)
+RD_AJ_hat<- numeric(num_simulations)
+Delta_hat<- numeric(num_simulations)
+ci_RD_KM_low<- numeric(num_simulations)
+ci_RD_KM_high<- numeric(num_simulations)
+ci_RD_AJ_low<- numeric(num_simulations)
+ci_RD_AJ_high<- numeric(num_simulations)
+ci_Delta_low<- numeric(num_simulations)
+ci_Delta_high<- numeric(num_simulations)
 
-dat <- modified_data_bin
+
+for (i in 1:num_simulations) {
+  
+dat <- data.m[[i]]
 d0 <- subset(dat, treat == 0, select = c(time, fstatus))
 d1 <- subset(dat, treat == 1, select = c(time, fstatus))
 
@@ -652,12 +707,12 @@ KM0   <- 1 - summary(sf0, times = tstar, extend = TRUE)$surv
 ci0   <- cuminc(ftime = d0$time, fstatus = d0$fstatus, cencode = cencode)
 nms0  <- names(ci0); last0 <- trimws(sapply(strsplit(nms0, " "), function(z) tail(z, 1)))
 ix0   <- which(last0 == as.character(cause))[1]
-if (!is.na(ix0)) {
+#if (!is.na(ix0)) {
   comp0 <- ci0[[ix0]]
   AJ0   <- approx(comp0$time, comp0$est, xout = tstar,
                   method = "constant", f = 1, rule = 2, ties = "ordered")$y
-  if (is.na(AJ0)) AJ0 <- tail(comp0$est, 1)
-} else AJ0 <- 0
+#  if (is.na(AJ0)) AJ0 <- tail(comp0$est, 1)
+#} else AJ0 <- 0
 
 # Arm 1 KM
 s01_1 <- as.integer(d1$fstatus == cause)
@@ -668,16 +723,16 @@ KM1   <- 1 - summary(sf1, times = tstar, extend = TRUE)$surv
 ci1   <- cuminc(ftime = d1$time, fstatus = d1$fstatus, cencode = cencode)
 nms1  <- names(ci1); last1 <- trimws(sapply(strsplit(nms1, " "), function(z) tail(z, 1)))
 ix1   <- which(last1 == as.character(cause))[1]
-if (!is.na(ix1)) {
+#if (!is.na(ix1)) {
   comp1 <- ci1[[ix1]]
   AJ1   <- approx(comp1$time, comp1$est, xout = tstar,
                   method = "constant", f = 1, rule = 2, ties = "ordered")$y
-  if (is.na(AJ1)) AJ1 <- tail(comp1$est, 1)
-} else AJ1 <- 0
+#  if (is.na(AJ1)) AJ1 <- tail(comp1$est, 1)
+#} else AJ1 <- 0
 
-RD_KM_hat <- KM1 - KM0
-RD_AJ_hat <- AJ1 - AJ0
-Delta_hat <- RD_AJ_hat - RD_KM_hat
+RD_KM_hat[[i]] <- KM1 - KM0
+RD_AJ_hat[[i]] <- AJ1 - AJ0
+Delta_hat[[i]] <- (AJ1 - AJ0) - (KM1 - KM0)
 
 
 ## --- BOOTSTRAP (paired within arms) ---
@@ -736,24 +791,51 @@ ci_RD_KM  <- quantile(RD_KM, c(0.025, 0.975), na.rm = TRUE)
 ci_RD_AJ  <- quantile(RD_AJ, c(0.025, 0.975), na.rm = TRUE)
 ci_Delta  <- quantile(Delta, c(0.025, 0.975), na.rm = TRUE)
 
+ci_RD_KM_low[[i]] <- ci_RD_KM[1]
+ci_RD_KM_high[[i]] <- ci_RD_KM[2]
+ci_RD_AJ_low[[i]] <- ci_RD_AJ[1]
+ci_RD_AJ_high[[i]] <- ci_RD_AJ[2]
+ci_Delta_low[[i]]<- ci_Delta[1]
+ci_Delta_high[[i]] <- ci_Delta[2]
+
 ## --- Bootstrap p-value for H0: Delta = 0 (symmetric two-sided) ---
-pval_Delta <- 2 * min(
+pval_Delta[[i]] <- 2 * min(
   mean(Delta >= 0, na.rm = TRUE),
   mean(Delta <= 0, na.rm = TRUE)
 )
+print(i)
+}
 
 ## --- PRINT (percent format) ---
 pct <- function(x) sprintf("%.2f%%", 100*x)
 
-data.frame(
+data.diff <- data.frame(
   Estimators = c("Kaplan-Meier", "Aalen-Johansen", "Difference"),
   Event = c("Censoring events", "Competing events", "--"),
-  Estimate = c(pct(RD_KM_hat), pct(RD_AJ_hat),  pct(Delta_hat)), 
-  CI = c(paste0(pct(ci_RD_KM[1]), " to ", pct(ci_RD_KM[2])), 
-               paste0(pct(ci_RD_AJ[1]), " to ", pct(ci_RD_AJ[2])),
-               paste0(pct(ci_Delta[1]), " to ", pct(ci_Delta[2]))
+  Estimate = c(
+    pct(quantile(RD_KM_hat, 0.5)),
+    pct(quantile(RD_AJ_hat, 0.5)),
+    pct(quantile(Delta_hat, 0.5))
+  ),
+  CI = c(paste0(
+          pct(quantile(ci_RD_KM_low, 0.5)), 
+          " to ", 
+          pct(quantile(ci_RD_KM_high, 0.5))
+                ), 
+        paste0(
+          pct(quantile(ci_RD_AJ_low, 0.5)), 
+          " to ", 
+          pct(quantile(ci_RD_AJ_high, 0.5))
+        ),
+        paste0(
+        pct(quantile(ci_Delta_low, 0.5)), 
+          " to ", 
+        pct(quantile(ci_Delta_high, 0.5))
               )
-                      ) %>% gt() %>% 
+        )
+    ) 
+
+data.diff %>% gt() %>% 
   cols_label(
     Estimators = md("**Estimator**"),
     Event = md("**How are deaths and 24hr-AF events handled?**"),
@@ -822,32 +904,34 @@ plot.full <-  ggplot() +
 
 
 ## format ARR lablels
-text_arr_km <- paste0(
-  round(RD_KM_hat*-100,2), 
-  "% (95% CI, ", 
-  round(ci_RD_KM[2]*-100,2),
-  " to ",
-  round(ci_RD_KM[1]*-100,2), 
-  ")"
-  )
 
-text_arr_aj <- paste0(
-  round(RD_AJ_hat*-100,2), 
-  "% (95% CI, ", 
-  round(ci_RD_AJ[2]*-100,2),
-  " to ",
-  round(ci_RD_AJ[1]*-100,2), 
+paste0(
+  data.diff[1,3], 
+  " (95% CI, ",
+  data.diff[1,4], 
   ")"
-  )
+)
+
+text_arr_km <- paste0(
+  data.diff[1,3], 
+  " (95% CI, ",
+  data.diff[1,4], 
+  ")"
+)
+
+text_arr_aj <-paste0(
+  data.diff[2,3], 
+  " (95% CI, ",
+  data.diff[2,4], 
+  ")"
+)
 
 text_diff <- paste0(
-  round(Delta_hat*100,2), 
-  " pp (95% CI, ", 
-  round(ci_Delta[1]*100,2),
-  " to ",
-  round(ci_Delta[2]*100,2), 
+  data.diff[3,3], 
+  " (95% CI, ",
+  data.diff[3,4], 
   ")"
-  )
+)
 
 
 ##zoomed inset
